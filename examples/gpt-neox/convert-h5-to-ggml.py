@@ -1,9 +1,36 @@
+# -*- coding: utf-8 -*-
 import sys
 import struct
 import json
 import numpy as np
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+
+# ref: https://github.com/openai/gpt-2/blob/master/src/encoder.py
+def bytes_to_unicode():
+
+    """
+    Returns list of utf-8 byte and a corresponding list of unicode strings.
+    The reversible bpe codes work on unicode strings.
+    This means you need a large # of unicode characters in your vocab if you want to avoid UNKs.
+    When you're at something like a 10B token dataset you end up needing around 5K for decent coverage.
+    This is a signficant percentage of your normal, say, 32K bpe vocab.
+    To avoid that, we want lookup tables between utf-8 bytes and unicode strings.
+    And avoids mapping to whitespace/control characters the bpe code barfs on.
+    """
+    bs = list(range(ord("!"), ord("~")+1))+list(range(ord("¡"), ord("¬")+1))+list(range(ord("®"), ord("ÿ")+1))
+    cs = bs[:]
+    n = 0
+    for b in range(2**8):
+        if b not in bs:
+            bs.append(b)
+            cs.append(2**8+n)
+            n += 1
+
+    cs = [chr(n) for n in cs]
+
+    return dict(zip(bs, cs))
+
 
 if len(sys.argv) < 3:
     print("Usage: convert-h5-to-ggml.py dir-model [use-f32]\n")
@@ -14,12 +41,6 @@ if len(sys.argv) < 3:
 # output in the same directory as the model
 dir_model = sys.argv[1]
 fname_out = sys.argv[1] + "/ggml-model.bin"
-
-with open(dir_model + "/tokenizer.json", "r", encoding="utf-8") as f:
-    encoder = json.load(f)
-
-with open(dir_model + "/config.json", "r", encoding="utf-8") as f:
-    hparams = json.load(f)
 
 # possible data types
 #   ftype == 0 -> float32
@@ -34,12 +55,14 @@ if len(sys.argv) > 2:
     if ftype < 0 or ftype > 1:
         print("Invalid ftype: " + str(ftype))
         sys.exit(1)
-    fname_out = sys.argv[1] + "/ggml-model-" + ftype_str[ftype] + ".bin"
+    fname_out = dir_model + "/ggml-model-" + ftype_str[ftype] + ".bin"
 
-
+if len(sys.argv) == 4:
+    fname_out = str(sys.argv[3]) + "/ggml-model-" + ftype_str[ftype] + ".bin"
+    
 tokenizer = AutoTokenizer.from_pretrained(dir_model)
 model = AutoModelForCausalLM.from_pretrained(dir_model, low_cpu_mem_usage=True)
-#print (model)
+hparams = AutoConfig.from_pretrained(dir_model).to_dict()
 
 #print(tokenizer.encode('I believe the meaning of life is'))
 
@@ -61,15 +84,37 @@ fout.write(struct.pack("i", int(hparams["rotary_pct"]*(hparams["hidden_size"]//h
 fout.write(struct.pack("i", hparams["use_parallel_residual"] if "use_parallel_residual" in hparams else True))
 fout.write(struct.pack("i", ftype))
 
-# TODO: temporary hack to not deal with implementing the tokenizer
-dot_token = tokenizer.encode('.')[0]
-for i in range(hparams["vocab_size"]):
-    text = tokenizer.decode([dot_token, i]).encode('utf-8')
-    # remove the first byte (it's always '.')
-    text = text[1:]
+vocab_size = hparams["vocab_size"]
+
+encoder = tokenizer.vocab
+# Add added_tokens (special tokens) to the encoder
+encoder.update(tokenizer.get_added_vocab())
+
+byte_encoder = bytes_to_unicode()
+byte_decoder = {v:k for k, v in byte_encoder.items()}
+
+counter = 0
+# sort by value
+for key in sorted(encoder, key=encoder.get):
+    # workaround for key error when c = whitespace
+    text=""
+    for c in key:
+        if c == " ":
+            text += " "
+        else:
+            text += chr(byte_decoder[c] )
+    text = bytearray( text, encoding="utf-8" )
     fout.write(struct.pack("i", len(text)))
     fout.write(text)
+    counter += 1
 
+# Repeat last token until vocab_size
+while counter < vocab_size:
+    fout.write(struct.pack("i", len(text)))
+    fout.write(text)
+    counter += 1
+
+    
 for name in list_vars.keys():
     data = list_vars[name].squeeze().numpy()
     print("Processing variable: " + name + " with shape: ", data.shape)

@@ -137,6 +137,9 @@ bool gpt_neox_model_load(const std::string & fname, gpt_neox_model & model, gpt_
             fin.read((char *) buf.data(), len);
             word.assign(buf.data(), len);
 
+	    // Convert token from utf-8
+	    utf8_to_string(word, word);
+	    
             vocab.token_to_id[word] = i;
             vocab.id_to_token[i] = word;
         }
